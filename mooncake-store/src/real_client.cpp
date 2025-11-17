@@ -1,5 +1,3 @@
-#include "pybind_client.h"
-
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -12,6 +10,7 @@
 #include <cstdlib>  // for atexit
 #include <optional>
 
+#include "real_client.h"
 #include "client_buffer.hpp"
 #include "config.h"
 #include "mutex.h"
@@ -19,6 +18,8 @@
 #include "utils.h"
 
 namespace mooncake {
+
+PyClient::~PyClient() {}
 
 // ResourceTracker implementation using singleton pattern
 // Use a deliberately leaked heap object to avoid static destruction
@@ -134,23 +135,23 @@ void ResourceTracker::startSignalThread() {
     });
 }
 
-PyClient::PyClient() {
+RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     easylog::set_min_severity(easylog::Severity::WARN);
 }
 
-PyClient::~PyClient() {
+RealClient::~RealClient() {
     // Ensure resources are cleaned even if not explicitly closed
     tearDownAll_internal();
 }
 
-std::shared_ptr<PyClient> PyClient::create() {
-    auto sp = std::shared_ptr<PyClient>(new PyClient());
+std::shared_ptr<RealClient> RealClient::create() {
+    auto sp = std::shared_ptr<RealClient>(new RealClient());
     ResourceTracker::getInstance().registerInstance(sp);
     return sp;
 }
 
-tl::expected<void, ErrorCode> PyClient::setup_internal(
+tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
     const std::string &protocol, const std::string &rdma_devices,
@@ -190,9 +191,12 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
-    client_buffer_allocator_ =
-        ClientBufferAllocator::create(local_buffer_size, this->protocol);
+    // Dummy Client can create shm and share it with Real Client, so Real Client
+    // can create client buffer allocator on the shared memory later.
+
     if (local_buffer_size > 0) {
+        client_buffer_allocator_ =
+            ClientBufferAllocator::create(local_buffer_size, this->protocol);
         auto result = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), local_buffer_size,
             kWildcardLocation, false, true);
@@ -242,19 +246,19 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     return {};
 }
 
-int PyClient::setup(const std::string &local_hostname,
-                    const std::string &metadata_server,
-                    size_t global_segment_size, size_t local_buffer_size,
-                    const std::string &protocol,
-                    const std::string &rdma_devices,
-                    const std::string &master_server_addr,
-                    const std::shared_ptr<TransferEngine> &transfer_engine) {
+int RealClient::setup(const std::string &local_hostname,
+                      const std::string &metadata_server,
+                      size_t global_segment_size, size_t local_buffer_size,
+                      const std::string &protocol,
+                      const std::string &rdma_devices,
+                      const std::string &master_server_addr,
+                      const std::shared_ptr<TransferEngine> &transfer_engine) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine));
 }
 
-tl::expected<void, ErrorCode> PyClient::initAll_internal(
+tl::expected<void, ErrorCode> RealClient::initAll_internal(
     const std::string &protocol_, const std::string &device_name,
     size_t mount_segment_size) {
     if (client_) {
@@ -267,14 +271,14 @@ tl::expected<void, ErrorCode> PyClient::initAll_internal(
                           device_name);
 }
 
-int PyClient::initAll(const std::string &protocol_,
-                      const std::string &device_name,
-                      size_t mount_segment_size) {
+int RealClient::initAll(const std::string &protocol_,
+                        const std::string &device_name,
+                        size_t mount_segment_size) {
     return to_py_ret(
         initAll_internal(protocol_, device_name, mount_segment_size));
 }
 
-tl::expected<void, ErrorCode> PyClient::tearDownAll_internal() {
+tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
@@ -293,12 +297,15 @@ tl::expected<void, ErrorCode> PyClient::tearDownAll_internal() {
     local_hostname = "";
     device_name = "";
     protocol = "";
+    shm_name_ = "";
+    shm_addr_offset_ = 0;
+    shm_size_ = 0;
     return {};
 }
 
-int PyClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
+int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
 
-tl::expected<void, ErrorCode> PyClient::put_internal(
+tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config) {
     if (config.prefer_alloc_in_same_node) {
@@ -328,12 +335,12 @@ tl::expected<void, ErrorCode> PyClient::put_internal(
     return {};
 }
 
-int PyClient::put(const std::string &key, std::span<const char> value,
-                  const ReplicateConfig &config) {
+int RealClient::put(const std::string &key, std::span<const char> value,
+                    const ReplicateConfig &config) {
     return to_py_ret(put_internal(key, value, config));
 }
 
-tl::expected<void, ErrorCode> PyClient::put_batch_internal(
+tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config) {
@@ -395,13 +402,13 @@ tl::expected<void, ErrorCode> PyClient::put_batch_internal(
     return {};
 }
 
-int PyClient::put_batch(const std::vector<std::string> &keys,
-                        const std::vector<std::span<const char>> &values,
-                        const ReplicateConfig &config) {
+int RealClient::put_batch(const std::vector<std::string> &keys,
+                          const std::vector<std::span<const char>> &values,
+                          const ReplicateConfig &config) {
     return to_py_ret(put_batch_internal(keys, values, config));
 }
 
-tl::expected<void, ErrorCode> PyClient::put_parts_internal(
+tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     const std::string &key, std::vector<std::span<const char>> values,
     const ReplicateConfig &config) {
     if (config.prefer_alloc_in_same_node) {
@@ -456,13 +463,13 @@ tl::expected<void, ErrorCode> PyClient::put_parts_internal(
     return {};
 }
 
-int PyClient::put_parts(const std::string &key,
-                        std::vector<std::span<const char>> values,
-                        const ReplicateConfig &config) {
+int RealClient::put_parts(const std::string &key,
+                          std::vector<std::span<const char>> values,
+                          const ReplicateConfig &config) {
     return to_py_ret(put_parts_internal(key, values, config));
 }
 
-tl::expected<void, ErrorCode> PyClient::remove_internal(
+tl::expected<void, ErrorCode> RealClient::remove_internal(
     const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -475,11 +482,11 @@ tl::expected<void, ErrorCode> PyClient::remove_internal(
     return {};
 }
 
-int PyClient::remove(const std::string &key) {
+int RealClient::remove(const std::string &key) {
     return to_py_ret(remove_internal(key));
 }
 
-tl::expected<long, ErrorCode> PyClient::removeByRegex_internal(
+tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
     const std::string &str) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -488,11 +495,11 @@ tl::expected<long, ErrorCode> PyClient::removeByRegex_internal(
     return client_->RemoveByRegex(str);
 }
 
-long PyClient::removeByRegex(const std::string &str) {
+long RealClient::removeByRegex(const std::string &str) {
     return to_py_ret(removeByRegex_internal(str));
 }
 
-tl::expected<int64_t, ErrorCode> PyClient::removeAll_internal() {
+tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal() {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -500,9 +507,9 @@ tl::expected<int64_t, ErrorCode> PyClient::removeAll_internal() {
     return client_->RemoveAll();
 }
 
-long PyClient::removeAll() { return to_py_ret(removeAll_internal()); }
+long RealClient::removeAll() { return to_py_ret(removeAll_internal()); }
 
-tl::expected<bool, ErrorCode> PyClient::isExist_internal(
+tl::expected<bool, ErrorCode> RealClient::isExist_internal(
     const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -511,7 +518,7 @@ tl::expected<bool, ErrorCode> PyClient::isExist_internal(
     return client_->IsExist(key);
 }
 
-int PyClient::isExist(const std::string &key) {
+int RealClient::isExist(const std::string &key) {
     auto result = isExist_internal(key);
 
     if (result.has_value()) {
@@ -521,7 +528,8 @@ int PyClient::isExist(const std::string &key) {
     }
 }
 
-std::vector<int> PyClient::batchIsExist(const std::vector<std::string> &keys) {
+std::vector<int> RealClient::batchIsExist(
+    const std::vector<std::string> &keys) {
     auto internal_results = batchIsExist_internal(keys);
     std::vector<int> results;
     results.reserve(internal_results.size());
@@ -537,7 +545,7 @@ std::vector<int> PyClient::batchIsExist(const std::vector<std::string> &keys) {
     return results;
 }
 
-tl::expected<int64_t, ErrorCode> PyClient::getSize_internal(
+tl::expected<int64_t, ErrorCode> RealClient::getSize_internal(
     const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -566,12 +574,139 @@ tl::expected<int64_t, ErrorCode> PyClient::getSize_internal(
     return total_size;
 }
 
-int64_t PyClient::getSize(const std::string &key) {
+int64_t RealClient::getSize(const std::string &key) {
     return to_py_ret(getSize_internal(key));
 }
 
+tl::expected<void, ErrorCode> RealClient::map_shm_internal(
+    const std::string &shm_name, uint64_t dummy_base_addr, size_t shm_size,
+    size_t local_buffer_size) {
+    // Open shared memory object
+    auto shm_fd = shm_open(shm_name.c_str(), O_RDWR, S_IRUSR | S_IWUSR);
+    if (shm_fd == -1) {
+        LOG(ERROR) << "Failed to open shared memory: " << shm_name
+                   << ", error: " << strerror(errno);
+        throw std::runtime_error("Failed to open shared memory");
+    }
+
+    // Map shared memory into the process's address space
+    shm_buffer_ =
+        mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_buffer_ == MAP_FAILED) {
+        LOG(ERROR) << "Failed to map shared memory: " << shm_name
+                   << ", error: " << strerror(errno);
+        close(shm_fd);
+        shm_unlink(shm_name.c_str());
+        throw std::runtime_error("Failed to map shared memory");
+    }
+    LOG(INFO) << "Shared memory mapped successfully: " << shm_name
+              << ", size: " << byte_size_to_string(shm_size)
+              << ", local buffer size: "
+              << byte_size_to_string(local_buffer_size);
+
+    // Close the shared memory file descriptor after mapping
+    close(shm_fd);
+
+    shm_addr_offset_ = reinterpret_cast<uintptr_t>(shm_buffer_) -
+                       reinterpret_cast<uintptr_t>(dummy_base_addr);
+
+    shm_name_ = shm_name;
+    shm_size_ = shm_size;
+    local_buffer_size_ = local_buffer_size;
+    if (shm_size > 0) {
+        auto result = client_->RegisterLocalMemory(
+            shm_buffer_, shm_size, kWildcardLocation, false, true);
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to register memory: "
+                       << toString(result.error());
+            return tl::unexpected(result.error());
+        }
+        LOG(INFO) << "Registered shared memory successfully: " << shm_name
+                  << ", size: " << byte_size_to_string(shm_size);
+    } else {
+        LOG(INFO) << "Shm buffer size is 0, skip registering memory";
+    }
+
+    if (client_buffer_allocator_) {
+        LOG(INFO) << "Client buffer allocator is already initialized";
+        return {};
+    }
+
+    // We assume shm_buffer_ and shm_size_ are already set by map_shm_internal.
+    // Create client buffer allocator on the shared memory.
+    // Note: We use the latter part of the shared memory for client buffer, the
+    // front part is used for registered memory.
+    client_buffer_allocator_ = ClientBufferAllocator::create(
+        reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shm_buffer_) +
+                                 shm_size_ - local_buffer_size),
+        local_buffer_size, this->protocol);
+    LOG(INFO)
+        << "Client buffer allocator created on shared memory successfully, "
+        << "size: " << byte_size_to_string(local_buffer_size);
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::unmap_shm_internal() {
+    client_buffer_allocator_.reset();
+    if (total_registered_size_ > 0) {
+        LOG(WARNING)
+            << "There are still registered buffers when unmapping shm, size: "
+            << total_registered_size_;
+    }
+    if (!shm_addr_offset_) {
+        if (munmap(shm_buffer_, shm_size_) == -1) {
+            LOG(ERROR) << "Failed to unmap shared memory: " << shm_name_
+                       << ", error: " << strerror(errno);
+        }
+        LOG(INFO) << "Shared memory unmapped successfully: " << shm_name_;
+        // Note: We do not shm_unlink here, as the creator of the shared
+        // memory is responsible for unlinking it.
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::register_shm_buffer_internal(
+    uint64_t dummy_base_addr, size_t registered_size) {
+    uint64_t real_base_addr = dummy_base_addr + shm_addr_offset_;
+    if (registered_buffers_.find(real_base_addr) != registered_buffers_.end()) {
+        LOG(ERROR) << "Buffer with base address (real: " << real_base_addr
+                   << ") " << " , (dummy: " << dummy_base_addr << ") "
+                   << " is already registered";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (registered_size + total_registered_size_ + local_buffer_size_ >
+        shm_size_) {
+        LOG(ERROR)
+            << "Not enough shared memory to register buffer, requested size: "
+            << registered_size
+            << ", used size: " << total_registered_size_ + local_buffer_size_
+            << ", shm size: " << shm_size_;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    registered_buffers_.emplace(real_base_addr, registered_size);
+    total_registered_size_ += registered_size;
+    return {};
+}
+
+tl::expected<size_t, ErrorCode> RealClient::unregister_shm_buffer_internal(
+    uint64_t dummy_base_addr) {
+    uint64_t real_base_addr = dummy_base_addr + shm_addr_offset_;
+    auto it = registered_buffers_.find(real_base_addr);
+    if (it != registered_buffers_.end()) {
+        total_registered_size_ -= it->second;
+        registered_buffers_.erase(it);
+    } else {
+        LOG(ERROR)
+            << "Failed to find registered buffer with base address (real: "
+            << real_base_addr << ") " << " , (dummy: " << dummy_base_addr
+            << ");";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return it->second;
+}
+
 // Implementation of get_buffer method
-std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
+std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return nullptr;
@@ -629,9 +764,33 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
     return std::make_shared<BufferHandle>(std::move(buffer_handle));
 }
 
+std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
+    const std::string &key) {
+    auto buffer_handle = get_buffer(key);
+    if (!buffer_handle) {
+        LOG(ERROR) << "Failed to get buffer for key: " << key;
+        return std::make_tuple(0, 0);
+    }
+    uint64_t buffer_base = reinterpret_cast<uint64_t>(buffer_handle->ptr());
+    size_t buffer_size = buffer_handle->size();
+    return std::make_tuple(buffer_base, buffer_size);
+}
+
+tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
+RealClient::get_dummy_buffer_internal(const std::string &key) {
+    auto buffer_handle = get_buffer(key);
+    if (!buffer_handle) {
+        LOG(ERROR) << "Failed to get buffer for key: " << key;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    uint64_t buffer_base = reinterpret_cast<uint64_t>(buffer_handle->ptr());
+    size_t buffer_size = buffer_handle->size();
+    return std::make_tuple(buffer_base - shm_addr_offset_, buffer_size);
+}
+
 // Implementation of batch_get_buffer_internal method
-std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
-    const std::vector<std::string> &keys) {
+std::vector<std::shared_ptr<BufferHandle>>
+RealClient::batch_get_buffer_internal(const std::vector<std::string> &keys) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -737,13 +896,13 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
 }
 
 // Implementation of batch_get_buffer method
-std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer(
+std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
     const std::vector<std::string> &keys) {
     return batch_get_buffer_internal(keys);
 }
 
-tl::expected<void, ErrorCode> PyClient::register_buffer_internal(void *buffer,
-                                                                 size_t size) {
+tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
+    void *buffer, size_t size) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -752,11 +911,11 @@ tl::expected<void, ErrorCode> PyClient::register_buffer_internal(void *buffer,
                                         true);
 }
 
-int PyClient::register_buffer(void *buffer, size_t size) {
+int RealClient::register_buffer(void *buffer, size_t size) {
     return to_py_ret(register_buffer_internal(buffer, size));
 }
 
-tl::expected<void, ErrorCode> PyClient::unregister_buffer_internal(
+tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     void *buffer) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -771,11 +930,11 @@ tl::expected<void, ErrorCode> PyClient::unregister_buffer_internal(
     return {};
 }
 
-int PyClient::unregister_buffer(void *buffer) {
+int RealClient::unregister_buffer(void *buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
-tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
+tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
     const std::string &key, void *buffer, size_t size) {
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
@@ -848,16 +1007,16 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     return static_cast<int64_t>(total_size);
 }
 
-int64_t PyClient::get_into(const std::string &key, void *buffer, size_t size) {
+int64_t RealClient::get_into(const std::string &key, void *buffer,
+                             size_t size) {
     return to_py_ret(get_into_internal(key, buffer, size));
 }
 
-std::string PyClient::get_hostname() const { return local_hostname; }
+std::string RealClient::get_hostname() const { return local_hostname; }
 
-std::vector<int> PyClient::batch_put_from(const std::vector<std::string> &keys,
-                                          const std::vector<void *> &buffers,
-                                          const std::vector<size_t> &sizes,
-                                          const ReplicateConfig &config) {
+std::vector<int> RealClient::batch_put_from(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
     auto internal_results =
         batch_put_from_internal(keys, buffers, sizes, config);
     std::vector<int> results;
@@ -870,7 +1029,22 @@ std::vector<int> PyClient::batch_put_from(const std::vector<std::string> &keys,
     return results;
 }
 
-std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_from_dummy_internal(
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    std::vector<void *> buffers;
+    buffers.reserve(dummy_buffers.size());
+
+    for (auto dummy_buffer : dummy_buffers) {
+        buffers.push_back(
+            reinterpret_cast<void *>(dummy_buffer + shm_addr_offset_));
+    }
+    return batch_put_from_internal(keys, buffers, sizes, config);
+}
+
+std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
     if (config.prefer_alloc_in_same_node) {
@@ -928,7 +1102,7 @@ std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
     return client_->BatchPut(keys, ordered_batched_slices, config);
 }
 
-tl::expected<void, ErrorCode> PyClient::put_from_internal(
+tl::expected<void, ErrorCode> RealClient::put_from_internal(
     const std::string &key, void *buffer, size_t size,
     const ReplicateConfig &config) {
     // NOTE: The buffer address must be previously registered with
@@ -966,12 +1140,12 @@ tl::expected<void, ErrorCode> PyClient::put_from_internal(
     return {};
 }
 
-int PyClient::put_from(const std::string &key, void *buffer, size_t size,
-                       const ReplicateConfig &config) {
+int RealClient::put_from(const std::string &key, void *buffer, size_t size,
+                         const ReplicateConfig &config) {
     return to_py_ret(put_from_internal(key, buffer, size, config));
 }
 
-std::vector<int64_t> PyClient::batch_get_into(
+std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
     auto internal_results = batch_get_into_internal(keys, buffers, sizes);
@@ -985,9 +1159,24 @@ std::vector<int64_t> PyClient::batch_get_into(
     return results;
 }
 
-std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
-    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_dummy_internal(
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_buffers,
     const std::vector<size_t> &sizes) {
+    std::vector<void *> buffers;
+    buffers.reserve(dummy_buffers.size());
+    for (auto dummy_buffer : dummy_buffers) {
+        buffers.push_back(
+            reinterpret_cast<void *>(dummy_buffer + shm_addr_offset_));
+    }
+    return batch_get_into_internal(keys, buffers, sizes);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
+                                    const std::vector<void *> &buffers,
+                                    const std::vector<size_t> &sizes) {
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -1131,7 +1320,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
     return results;
 }
 
-std::vector<tl::expected<bool, ErrorCode>> PyClient::batchIsExist_internal(
+std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
     const std::vector<std::string> &keys) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -1148,10 +1337,10 @@ std::vector<tl::expected<bool, ErrorCode>> PyClient::batchIsExist_internal(
     return client_->BatchIsExist(keys);
 }
 
-int PyClient::put_from_with_metadata(const std::string &key, void *buffer,
-                                     void *metadata_buffer, size_t size,
-                                     size_t metadata_size,
-                                     const ReplicateConfig &config) {
+int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
+                                       void *metadata_buffer, size_t size,
+                                       size_t metadata_size,
+                                       const ReplicateConfig &config) {
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
     if (config.prefer_alloc_in_same_node) {
@@ -1197,7 +1386,7 @@ int PyClient::put_from_with_metadata(const std::string &key, void *buffer,
     return 0;
 }
 
-std::vector<int> PyClient::batch_put_from_multi_buffers(
+std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
@@ -1221,7 +1410,7 @@ std::vector<int> PyClient::batch_put_from_multi_buffers(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-PyClient::batch_put_from_multi_buffers_internal(
+RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
@@ -1257,7 +1446,7 @@ PyClient::batch_put_from_multi_buffers_internal(
     return client_->BatchPut(keys, batched_slices, config);
 }
 
-std::vector<int> PyClient::batch_get_into_multi_buffers(
+std::vector<int> RealClient::batch_get_into_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
@@ -1279,7 +1468,7 @@ std::vector<int> PyClient::batch_get_into_multi_buffers(
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
-PyClient::batch_get_into_multi_buffers_internal(
+RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
