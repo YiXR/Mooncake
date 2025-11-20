@@ -16,6 +16,7 @@
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
+#include "rpc_types.h"
 
 namespace mooncake {
 
@@ -653,7 +654,8 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal() {
             << "There are still registered buffers when unmapping shm, size: "
             << total_registered_size_;
     }
-    if (!shm_addr_offset_) {
+    if (shm_buffer_) {
+        client_->unregisterLocalMemory(shm_buffer_, shm_size_);
         if (munmap(shm_buffer_, shm_size_) == -1) {
             LOG(ERROR) << "Failed to unmap shared memory: " << shm_name_
                        << ", error: " << strerror(errno);
@@ -662,6 +664,13 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal() {
         // Note: We do not shm_unlink here, as the creator of the shared
         // memory is responsible for unlinking it.
     }
+    shm_buffer_ = nullptr;
+    shm_name_.clear();
+    shm_size_ = 0;
+    local_buffer_size_ = 0;
+    shm_addr_offset_ = 0;
+    registered_buffers_.clear();
+    total_registered_size_ = 0;
     return {};
 }
 
@@ -1598,4 +1607,77 @@ RealClient::batch_get_into_multi_buffers_internal(
     }
     return results;
 }
+
+tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    ClientStatus client_status = ClientStatus::OK;
+
+    PodUUID pod_client_id = {client_id.first, client_id.second};
+    if (!dummy_client_ping_queue_.push(pod_client_id)) {
+        // Queue is full
+        LOG(ERROR) << "client_id=" << client_id
+                   << ", error=dummy_client_ping_queue_";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return PingResponse(view_version_, client_status);
+}
+
+void RealClient::dummy_client_monitor_func() {
+    std::unordered_map<UUID, std::chrono::steady_clock::time_point,
+                       boost::hash<UUID>>
+        client_ttl;
+    while (dummy_client_monitor_running_) {
+        auto now = std::chrono::steady_clock::now();
+
+        // Update the client ttl
+        PodUUID pod_client_id;
+        while (dummy_client_ping_queue_.pop(pod_client_id)) {
+            UUID client_id = {pod_client_id.first, pod_client_id.second};
+            client_ttl[client_id] =
+                now + std::chrono::seconds(dummy_client_live_ttl_sec_);
+        }
+
+        // Find out expired clients
+        std::vector<UUID> expired_clients;
+        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
+            if (it->second < now) {
+                LOG(INFO) << "client_id=" << it->first
+                          << ", action=client_expired";
+                expired_clients.push_back(it->first);
+                it = client_ttl.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        // Update the client status to NEED_REMOUNT
+        if (!expired_clients.empty()) {
+            {
+                // Lock client_mutex and segment_mutex
+                std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+                // Unmap shm segments associated with this client
+                // TODO: need to optimize this with client_id
+                unmap_shm_internal();
+            }  // Release the mutex before long-running ClearInvalidHandles and
+               // avoid deadlocks
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kDummyClientMonitorSleepMs));
+    }
+}
+
+int RealClient::start_dummy_client_monitor() {
+    // Start client monitor thread in all modes so TTL/heartbeat works
+    dummy_client_monitor_running_ = true;
+    dummy_client_monitor_thread_ =
+        std::thread(&RealClient::dummy_client_monitor_func, this);
+    if (!dummy_client_monitor_thread_.joinable()) {
+        LOG(ERROR) << "Failed to start dummy_client_monitor_thread";
+        return -1;
+    }
+    LOG(INFO) << "start dummy_client_monitor_thread";
+    return 0;
+}
+
 }  // namespace mooncake

@@ -10,6 +10,8 @@
 #include "real_client.h"
 #include "dummy_client.h"
 #include "utils/scoped_vlog_timer.h"
+#include "rpc_types.h"
+#include "types.h"
 
 namespace mooncake {
 
@@ -72,10 +74,9 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
         }());
 }
 
-DummyClient::DummyClient() {
+DummyClient::DummyClient() : client_id_(generate_uuid()) {
     // Initialize logging severity (leave as before)
     easylog::set_min_severity(easylog::Severity::WARN);
-
     // Initialize client pools
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     const char* value = std::getenv("MC_RPC_PROTOCOL");
@@ -128,7 +129,11 @@ int DummyClient::setup(const std::string& local_hostname,
         return -1;
     }
 
-    shm_name_ = "/dummy_client_shm_" + std::to_string(getpid());
+    ping_running_ = true;
+    ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
+
+    shm_name_ = "/dummy_client_shm_" + std::to_string(client_id_.first) + "_" +
+                std::to_string(client_id_.second);
     shm_size_ = local_buffer_size + global_segment_size;
 
     // Open or create shared memory object
@@ -204,6 +209,12 @@ int DummyClient::tearDownAll() {
         shm_base_addr_ = nullptr;
         shm_size_ = 0;
         // Dummy client unlinks shm in setup after real client mmap
+    }
+    if (ping_running_) {
+        ping_running_ = false;
+        if (ping_thread_.joinable()) {
+            ping_thread_.join();
+        }
     }
     return 0;
 }
@@ -333,7 +344,8 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
     return nullptr;
 }
 
-std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(const std::string& key) {
+std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
+    const std::string& key) {
     auto result = invoke_rpc<&RealClient::get_dummy_buffer_internal,
                              std::tuple<uint64_t, size_t>>(key);
     if (!result.has_value()) {
@@ -432,6 +444,39 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     // TODO: implement this function
     std::vector<int> vec(keys.size(), -1);
     return vec;
+}
+
+void DummyClient::ping_thread_main() {
+    // How many failed pings before getting latest master view from etcd
+    const int max_ping_fail_count = 3;
+    // How long to wait for next ping after success
+    const int success_ping_interval_ms = 1000;
+    // How long to wait for next ping after failure
+    const int fail_ping_interval_ms = 1000;
+    // Increment after a ping failure, reset after a ping success
+    int ping_fail_count = 0;
+    while (ping_running_) {
+        auto ping_result =
+            invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        if (ping_result.has_value() &&
+            ping_result.value().client_status == ClientStatus::OK) {
+            ping_fail_count = 0;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(success_ping_interval_ms));
+            continue;
+        } else {
+            ping_fail_count++;
+            if (ping_fail_count >= max_ping_fail_count) {
+                LOG(ERROR) << "Ping failed " << ping_fail_count
+                           << " times, reconnecting...";
+                // TODO: Need to realize reconnect logic here
+                ping_fail_count = 0;
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(fail_ping_interval_ms));
+            continue;
+        }
+    }
 }
 
 }  // namespace mooncake

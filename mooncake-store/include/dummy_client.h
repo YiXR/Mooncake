@@ -164,10 +164,16 @@ class DummyClient : public PyClient {
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
 
+    // For shared memory management
     std::string shm_name_;
     void *shm_base_addr_ = nullptr;
     size_t shm_size_ = 0;
     size_t registered_size_ = 0;
+
+    // For high availability
+    std::thread ping_thread_;
+    std::atomic<bool> ping_running_{false};
+    void ping_thread_main();
 };
 
 }  // namespace mooncake

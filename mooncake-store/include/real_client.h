@@ -1,10 +1,12 @@
 #pragma once
 
-#include <csignal>
 #include <atomic>
-#include <thread>
-#include <string>
+#include <boost/lockfree/queue.hpp>
+#include <csignal>
 #include <memory>
+#include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "pyclient.h"
@@ -12,6 +14,7 @@
 #include "client_buffer.hpp"
 #include "mutex.h"
 #include "utils.h"
+#include "rpc_types.h"
 
 namespace mooncake {
 
@@ -373,6 +376,8 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys);
 
+    tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
+
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
@@ -410,6 +415,26 @@ class RealClient : public PyClient {
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    // Dummy Client manage related members
+    mutable std::shared_mutex dummy_client_mutex_;
+    void dummy_client_monitor_func();
+    int start_dummy_client_monitor();
+    std::thread dummy_client_monitor_thread_;
+    std::atomic<bool> dummy_client_monitor_running_{false};
+    static constexpr uint64_t kDummyClientMonitorSleepMs =
+        1000;  // 1000 ms sleep between client monitor checks
+    // boost lockfree queue requires trivial assignment operator
+    struct PodUUID {
+        uint64_t first;
+        uint64_t second;
+    };
+    static constexpr size_t kDummyClientPingQueueSize =
+        128 * 1024;  // Size of the client ping queue
+    boost::lockfree::queue<PodUUID> dummy_client_ping_queue_{
+        kDummyClientPingQueueSize};
+    const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t view_version_ = 0;
 };
 
 }  // namespace mooncake
