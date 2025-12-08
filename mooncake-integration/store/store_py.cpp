@@ -554,6 +554,17 @@ class MooncakeStorePyWrapper {
     }
 };
 
+class MooncakeHostMemAllocatorPyWrapper {
+   public:
+    // Only support ShmHelper for now
+    ShmHelper *shm_helper_ = nullptr;
+
+    MooncakeHostMemAllocatorPyWrapper() {
+        shm_helper_ = ShmHelper::getInstance();
+    }
+    ~MooncakeHostMemAllocatorPyWrapper() { shm_helper_ = nullptr; }
+};
+
 PYBIND11_MODULE(store, m) {
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
@@ -657,6 +668,18 @@ PYBIND11_MODULE(store, m) {
                     {sizeof(char)}       /* Strides (in bytes) for each index */
                 );
             }
+        });
+
+    py::class_<MooncakeHostMemAllocatorPyWrapper>(m, "HostMemAllocator")
+        .def(py::init<>())
+        .def("alloc", [](MooncakeHostMemAllocatorPyWrapper &self, size_t size) {
+            py::gil_scoped_release release;
+            if (!self.shm_helper_) {
+                LOG(ERROR) << "Shared memory allocator is not initialized";
+                return static_cast<uintptr_t>(0);
+            }
+            void *ptr = self.shm_helper_->allocate(size);
+            return reinterpret_cast<uintptr_t>(ptr);
         });
 
     // Create a wrapper that exposes DistributedObjectStore with Python-specific

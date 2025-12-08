@@ -7,6 +7,32 @@
 
 namespace mooncake {
 
+class ShmHelper {
+   public:
+    static ShmHelper *getInstance();
+
+    void *allocate(size_t size);
+
+    void cleanup();
+
+    int get_fd() const { return shm_fd_; }
+
+    void *get_base_addr() const { return shm_base_addr_; }
+
+    size_t get_size() const { return shm_size_; }
+
+    ShmHelper(const ShmHelper &) = delete;
+    ShmHelper &operator=(const ShmHelper &) = delete;
+
+   private:
+    ShmHelper();
+    ~ShmHelper();
+
+    int shm_fd_ = -1;
+    void *shm_base_addr_ = nullptr;
+    size_t shm_size_ = 0;
+};
+
 class DummyClient : public PyClient {
    public:
     DummyClient();
@@ -179,7 +205,7 @@ class DummyClient : public PyClient {
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
 
     // For shared memory management
-    std::string shm_name_;
+    ShmHelper *shm_helper_ = nullptr;
     int shm_fd_ = -1;
     void *shm_base_addr_ = nullptr;
     size_t shm_size_ = 0;

@@ -19,9 +19,62 @@ static int memfd_create_wrapper(const char* name, unsigned int flags) {
 #ifdef __NR_memfd_create
     return syscall(__NR_memfd_create, name, flags);
 #else
-    errno = ENOSYS;
-    return -1;
+    return -1;  // Or appropriate fallback/error
 #endif
+}
+
+ShmHelper* ShmHelper::getInstance() {
+    static ShmHelper instance;
+    return &instance;
+}
+
+ShmHelper::ShmHelper() {}
+
+ShmHelper::~ShmHelper() { cleanup(); }
+
+void ShmHelper::cleanup() {
+    if (shm_base_addr_) {
+        munmap(shm_base_addr_, shm_size_);
+        shm_base_addr_ = nullptr;
+    }
+    if (shm_fd_ != -1) {
+        close(shm_fd_);
+        shm_fd_ = -1;
+    }
+    shm_size_ = 0;
+}
+
+void* ShmHelper::allocate(size_t size) {
+    if (shm_fd_ != -1) {
+        throw std::runtime_error("Shared memory has already been allocated.");
+    }
+
+    shm_size_ = size;
+
+    // Create memfd
+    shm_fd_ = memfd_create_wrapper("mooncake_shm", MFD_CLOEXEC);
+    if (shm_fd_ == -1) {
+        throw std::runtime_error("Failed to create anonymous shared memory: " +
+                                 std::string(strerror(errno)));
+    }
+
+    // Set size
+    if (ftruncate(shm_fd_, shm_size_) == -1) {
+        close(shm_fd_);
+        throw std::runtime_error("Failed to set shared memory size: " +
+                                 std::string(strerror(errno)));
+    }
+
+    // Map memory
+    shm_base_addr_ = mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, shm_fd_, 0);
+    if (shm_base_addr_ == MAP_FAILED) {
+        close(shm_fd_);
+        throw std::runtime_error("Failed to map shared memory: " +
+                                 std::string(strerror(errno)));
+    }
+
+    return shm_base_addr_;
 }
 
 static int send_fd(int socket, int fd, void* data, size_t data_len) {
@@ -209,8 +262,6 @@ int DummyClient::register_shm_via_ipc() {
     req.dummy_base_addr = reinterpret_cast<uintptr_t>(shm_base_addr_);
     req.shm_size = shm_size_;
     req.local_buffer_size = local_buffer_size_;
-    strncpy(req.shm_name, shm_name_.c_str(), sizeof(req.shm_name) - 1);
-    req.shm_name[sizeof(req.shm_name) - 1] = '\0';
 
     if (send_fd(sock_fd, shm_fd_, &req, sizeof(req)) < 0) {
         LOG(ERROR) << "Failed to send FD to RealClient: " << strerror(errno);
@@ -246,43 +297,36 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         return -1;
     }
 
-    shm_name_ = "mooncake_shm_" + std::to_string(client_id_.first) + "_" +
-                std::to_string(client_id_.second);
-    shm_size_ = local_buffer_size + mem_pool_size;
+    shm_helper_ = ShmHelper::getInstance();
+    if (!shm_helper_) {
+        LOG(ERROR) << "Failed to get shared memory allocator";
+        return -1;
+    }
+    shm_fd_ = shm_helper_->get_fd();
+    if (shm_fd_ == -1) {
+        // Allocate shared memory if not already allocated
+        shm_size_ = local_buffer_size + mem_pool_size;
+        shm_base_addr_ = shm_helper_->allocate(shm_size_);
+        if (shm_base_addr_ == MAP_FAILED) {
+            LOG(ERROR) << "Failed to allocate shared memory";
+            return -1;
+        }
+        shm_fd_ = shm_helper_->get_fd();
+    } else {
+        // Shared memory already allocated, just get the base address and size
+        shm_base_addr_ = shm_helper_->get_base_addr();
+        shm_size_ = shm_helper_->get_size();
+    }
+
     local_buffer_size_ = local_buffer_size;
     ipc_socket_path_ = ipc_socket_path;
-
-    // Use memfd_create instead of shm_open for anonymous shared memory
-    shm_fd_ = memfd_create_wrapper(shm_name_.c_str(), MFD_CLOEXEC);
-    if (shm_fd_ == -1) {
-        LOG(ERROR) << "Failed to create anonymous shared memory: "
-                   << strerror(errno);
-        return -1;
-    }
-
-    // Set the size of the shared memory object
-    if (ftruncate(shm_fd_, shm_size_) == -1) {
-        LOG(ERROR) << "Failed to set shared memory size: " << strerror(errno);
-        close(shm_fd_);
-        return -1;
-    }
-
-    // Map shared memory into the process's address space
-    shm_base_addr_ = mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE,
-                          MAP_SHARED, shm_fd_, 0);
-    if (shm_base_addr_ == MAP_FAILED) {
-        LOG(ERROR) << "Failed to map shared memory: " << strerror(errno);
-        close(shm_fd_);
-        return -1;
-    }
 
     // Attempt registration
     if (register_shm_via_ipc() != 0) {
         LOG(ERROR) << "Failed to register SHM via IPC";
-        munmap(shm_base_addr_, shm_size_);
-        close(shm_fd_);
         shm_fd_ = -1;
         shm_base_addr_ = nullptr;
+        shm_size_ = 0;
         return -1;
     }
 
@@ -294,21 +338,9 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 
 int DummyClient::tearDownAll() {
     unregister_shm();
-    if (shm_base_addr_ != nullptr) {
-        if (munmap(shm_base_addr_, shm_size_) == -1) {
-            LOG(ERROR) << "Failed to unmap shared memory: " << shm_name_
-                       << ", error: " << strerror(errno);
-            return -1;
-        }
-        shm_base_addr_ = nullptr;
-        shm_size_ = 0;
-        // Dummy client unlinks shm in setup after real client mmap
-    }
-
-    if (shm_fd_ >= 0) {
-        close(shm_fd_);
-        shm_fd_ = -1;
-    }
+    shm_fd_ = -1;
+    shm_base_addr_ = nullptr;
+    shm_size_ = 0;
 
     if (ping_running_) {
         ping_running_ = false;
